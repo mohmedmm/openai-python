@@ -8,6 +8,7 @@ from inline_snapshot import snapshot
 
 from tests import respx2
 from openai import OpenAI, OAuthError
+from openai._exceptions import SubjectTokenProviderError
 from openai.auth import WorkloadIdentity, WorkloadIdentityAuth, SubjectTokenWorkloadIdentity
 from tests.respx2.models import Call
 from openai.auth._workload import (
@@ -198,3 +199,33 @@ def test_gcp_id_token_provider() -> None:
 
     assert provider["token_type"] == "id"
     assert provider["get_token"]() == "gcp-token"
+
+
+@respx2.mock
+def test_workload_providers_preserve_error_response(tmp_path: Path) -> None:
+    respx2.get("http://169.254.169.254/metadata/identity/oauth2/token").mock(
+        return_value=httpx2.Response(500, text="Internal Server Error")
+    )
+    azure_provider = azure_managed_identity_token_provider()
+    with pytest.raises(SubjectTokenProviderError) as exc_azure:
+        azure_provider["get_token"]()
+    assert exc_azure.value.response is not None
+    assert exc_azure.value.response.status_code == 500
+    assert str(exc_azure.value) == "Failed to fetch Azure subject token from IMDS: HTTP 500"
+
+    respx2.get("http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/identity").mock(
+        return_value=httpx2.Response(503, text="Service Unavailable")
+    )
+    gcp_provider = gcp_id_token_provider()
+    with pytest.raises(SubjectTokenProviderError) as exc_gcp:
+        gcp_provider["get_token"]()
+    assert exc_gcp.value.response is not None
+    assert exc_gcp.value.response.status_code == 503
+    assert str(exc_gcp.value) == "Failed to fetch GCP subject token from metadata server: HTTP 503"
+
+    empty_token = tmp_path / "empty_token"
+    empty_token.write_text("")
+    k8s_provider = k8s_service_account_token_provider(empty_token)
+    with pytest.raises(SubjectTokenProviderError) as exc_k8s:
+        k8s_provider["get_token"]()
+    assert str(exc_k8s.value) == f"The token file at {empty_token} is empty."
