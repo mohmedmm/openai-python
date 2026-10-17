@@ -38,6 +38,7 @@ from ..._parsing import (
 from ...._streaming import Stream, AsyncStream
 from ....types.chat import ChatCompletionChunk, ParsedChatCompletion, ChatCompletionToolUnionParam
 from ...._exceptions import LengthFinishReasonError, ContentFilterFinishReasonError
+from .._partial_json import PartialJsonBuffer
 from ....types.chat.chat_completion import Moderation, ChoiceLogprobs
 from ....types.chat.chat_completion_chunk import Choice as ChoiceChunk
 from ....types.chat.completion_create_params import ResponseFormat as ResponseFormatParam
@@ -318,6 +319,8 @@ class ChatCompletionStreamState(Generic[ResponseFormatT]):
     ) -> None:
         self.__current_completion_snapshot: ParsedChatCompletionSnapshot | None = None
         self.__choice_event_states: list[ChoiceEventState] = []
+        self.__content_json_buffers: dict[int, PartialJsonBuffer] = {}
+        self.__tool_json_buffers: dict[tuple[int, int], PartialJsonBuffer] = {}
 
         self._input_tools = [tool for tool in input_tools] if is_given(input_tools) else []
         self._response_format = response_format
@@ -366,6 +369,7 @@ class ChatCompletionStreamState(Generic[ResponseFormatT]):
         for choice in chunk.choices:
             try:
                 choice_snapshot = completion_snapshot.choices[choice.index]
+                previous_parsed = choice_snapshot.message.parsed
                 previous_tool_calls = choice_snapshot.message.tool_calls or []
 
                 choice_snapshot.message = cast(
@@ -397,6 +401,7 @@ class ChatCompletionStreamState(Generic[ResponseFormatT]):
                         ),
                     ),
                 )
+                choice_snapshot.message.parsed = previous_parsed
 
                 # ensure tools that have already been parsed are added back into the newly
                 # constructed message snapshot
@@ -440,10 +445,16 @@ class ChatCompletionStreamState(Generic[ResponseFormatT]):
                 # partial parsing fails on white-space
                 and choice_snapshot.message.content.lstrip()
             ):
-                choice_snapshot.message.parsed = from_json(
-                    bytes(choice_snapshot.message.content, "utf-8"),
-                    partial_mode=True,
-                )
+                content_buf = self.__content_json_buffers.setdefault(choice.index, PartialJsonBuffer())
+                raw_content = bytes(choice_snapshot.message.content, "utf-8")
+                new_bytes = raw_content[len(content_buf) :]
+                extends_open_string = content_buf.feed(new_bytes) if new_bytes else False
+
+                if not extends_open_string:
+                    choice_snapshot.message.parsed = from_json(
+                        raw_content,
+                        partial_mode=True,
+                    )
 
             for tool_call_chunk in choice.delta.tool_calls or []:
                 tool_call_snapshot = (choice_snapshot.message.tool_calls or [])[tool_call_chunk.index]
@@ -458,10 +469,18 @@ class ChatCompletionStreamState(Generic[ResponseFormatT]):
                         and input_tool.get("function", {}).get("strict")
                         and tool_call_snapshot.function.arguments
                     ):
-                        tool_call_snapshot.function.parsed_arguments = from_json(
-                            bytes(tool_call_snapshot.function.arguments, "utf-8"),
-                            partial_mode=True,
+                        tool_buf = self.__tool_json_buffers.setdefault(
+                            (choice.index, tool_call_chunk.index), PartialJsonBuffer()
                         )
+                        raw_args = bytes(tool_call_snapshot.function.arguments, "utf-8")
+                        new_bytes = raw_args[len(tool_buf) :]
+                        extends_open_string = tool_buf.feed(new_bytes) if new_bytes else False
+
+                        if not extends_open_string:
+                            tool_call_snapshot.function.parsed_arguments = from_json(
+                                raw_args,
+                                partial_mode=True,
+                            )
                 elif TYPE_CHECKING:  # type: ignore[unreachable]
                     assert_never(tool_call_snapshot)
 
